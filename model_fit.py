@@ -1,15 +1,14 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 import numpy as np
 import scipy as sp
 import torch
 import time
 import igl
-import rig.riglogic as rl
+import os
+from dataclasses import dataclass
+from typing import Optional
+
+from .scripts import constants
+from .scripts.constants import logger
 
 
 def buildTR(device):
@@ -47,7 +46,7 @@ def add_homog_coordinate(M, dim):
     return np.concatenate([M, np.ones(x)], axis=dim).astype(M.dtype)
 
 
-def compBX(Wn, Brt, TR, n_bs, P):
+def compBX(Wn, Brt, TR, n_bs, P, rest_pose):
     # calculates Linear Blend Skinning
     # Wn ∈ PxN   (numBones x numVertices)
     # Brt - 6 degree of freedom  per blendshape per bone  (6, n_bs, numBones, 1, 1)
@@ -89,60 +88,6 @@ def compBX(Wn, Brt, TR, n_bs, P):
     return B @ X, B, X
 
 
-def train(num_iter, power, alpha, beta=None, normalizeW=False):
-    global Brt, W
-
-    st = time.time()
-    for i in range(num_iter):
-        if normalizeW:
-            Wn = W / W.sum(axis=0)
-        else:
-            Wn = W
-
-        BX, _, _ = compBX(Wn, Brt, TR, n_bs, P)
-        weighed_error = BX - A
-
-        if beta is not None:
-            weighed_error[:, salient_verts] *= beta
-
-        loss = weighed_error.pow(power).mean().pow(2 / power)
-        if alpha is not None:
-            # add Laplacian regularization term
-            loss += alpha * (L @ (BX).transpose(0, 1)).pow(2).mean()
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        with torch.no_grad():
-            Wcutoff = torch.topk(W, max_influences + 1, dim=0).values[-1, :]
-            Wmask = W > Wcutoff
-            Wpruned = Wmask * W
-            W.copy_(Wpruned)
-            W.clamp_(min=0)
-
-            Bdecider = Brt.abs()
-            Bcutoff = torch.topk(Bdecider.flatten(), total_nnz_Brt).values[-1]
-            Bmask = Bdecider >= Bcutoff
-            Bpruned = Bmask * Brt
-            Brt.copy_(Bpruned)
-
-        if i % 200 == 0:
-            BX, _, _ = compBX(Wn, Brt, TR, n_bs, P)
-            trunc_err = (BX - A).abs().max().item()
-
-            if device == "cuda":
-                torch.cuda.synchronize()
-
-            print(
-                f"{i:05d}({time.time() - st:.3f}) {loss.item():.5e} {trunc_err:.5e} {(Brt.abs() > 1e-4).count_nonzero().item()} {(W.abs() > 1e-4).count_nonzero().item()}"
-            )
-            loss_list.append(loss.item())
-            abserr_list.append(trunc_err)
-
-            st = time.time()
-
-
 def npf(T):
     return T.detach().cpu().numpy()
 
@@ -173,107 +118,188 @@ def generateXforms(weights, shapeXforms):
     #
     # Z.transpose(0, 2, 1).reshape(3, -1) @ shapeXforms + np.array([np.eye(3, 4)] * nBones).transpose(1, 0, 2).reshape(3, -1)
     #   add 1 to diagonals for every transform (befor was 0)
-    res = Z.transpose(0, 2, 1).reshape(3, -1) @ shapeXforms + np.array(
-        [np.eye(3, 4)] * nBones
-    ).transpose(1, 0, 2).reshape(3, -1)
+    res = Z.transpose(0, 2, 1).reshape(3, -1) @ shapeXforms + np.array([np.eye(3, 4)] * nBones).transpose(1, 0, 2).reshape(3, -1)
+
     return res
 
 
-model = "aura"  # change to 'jupiter' / 'proteus' / 'bowen' to run another model
-seed = 12345
-P = 40  # number of bones
-max_influences = 8  # number of weights per vertex
-total_nnz_Brt = 6000  # number of non-zero values into Brt matrix
-init_weight = 1e-3
-power = 2  # metric power
-beta = None
-alphaValues = {"aura": 10, "jupiter": 10, "proteus": 50, "bowen": 50}  # alpha values for all models
-
-torch.manual_seed(seed)
-device = "cuda" if torch.cuda.is_available() else "cpu"
-npb = np.load(f"in/{model}.npz", allow_pickle=True)
-n_bs = npb["deltas"].shape[0]
-deltas = npb["deltas"].transpose(1, 0, 2).reshape(-1, n_bs * 3).transpose()
-
-# A is blendshapes matrix. (goal of optimization)
-# shape: (num_blendShapes * 3 (x, y, z), num vertices)
-A = torch.from_numpy(deltas).float().to(device)
-N = A.shape[1]  # number of vertices
-
-quads = npb["rest_faces"]
-rest = npb["rest_verts"]
-
-adj = igl.adjacency_matrix(quads)
-adj_diag = np.array(np.sum(adj, axis=1)).squeeze()
-# Rigidness Laplacian regularization.
-# ⎧-1        if k = i
-# ⎨1/|N(i)|, if k ∈ N(i)
-# ⎩0         otherwise.
-# Where N(i) denotes all the 1-ring neighbours of i
-Lg = sp.sparse.diags(1 / adj_diag) @ (adj - sp.sparse.diags(adj_diag))
-L = torch.from_numpy((Lg).todense()).float().to(device).to_sparse()
-
-loss_list, abserr_list = [], []
-
-TR = buildTR(device)
-# Brt - 6 degree of freedom  per blendshape per bone  (6, numBlendshapes, numBones, 1, 1)
-Brt = (init_weight * torch.randn((6, n_bs, P, 1, 1))).clone().float().to(device).requires_grad_()
-
-rest_centered = rest - rest.mean(axis=0)
-# rest_pose  nx4 aray of vertices (with forth column 1)
-rest_pose = torch.from_numpy(add_homog_coordinate(rest_centered, 1)).float().to(device)
-# W PxN (numBonex x numVertices) weights one per vertex per bone
-W = (1e-8 * torch.randn(P, N)).clone().float().to(device).requires_grad_()
-
-alpha = alphaValues[model]
-param_list = [Brt, W]
-
-optimizer = torch.optim.Adam(param_list, lr=1e-3, betas=(0.9, 0.9))
-train(10000, power=power, alpha=alpha, beta=beta, normalizeW=False)
-
-optimizer = torch.optim.Adam(param_list, lr=1e-3, betas=(0.9, 0.9))
-train(10000, power=power, alpha=alpha, beta=beta, normalizeW=True)
+@dataclass
+class Settings:
+    input_file: str
+    output_dir: str
+    p_bones: int = 40
+    max_influences: int = 8
+    total_nnz_brt: int = 6000
+    power: int = 2
+    alpha: float = 10.0
+    beta: Optional[float] = None
+    lr: float = 1e-3
+    iter1: int = 10000
+    iter2: int = 10000
+    seed: int = 12345
+    init_weight: float = 1e-3
+    no_animation: bool = False # Set to True if you don't need the animation .obj files
 
 
-Wn = W / W.sum(axis=0)
-print(Wn.min().item(), Wn.max().item())
-BX, _, _ = compBX(Wn, Brt, TR, n_bs, P)
-orig_deltas = npf(A.transpose(1, 0).reshape(-1, n_bs, 3))
-our_deltas = npf(BX.transpose(1, 0).reshape(-1, n_bs, 3))
+class Trainer:
 
-maxDelta = np.abs(orig_deltas - our_deltas).max()
-meanDelta = np.abs(orig_deltas - our_deltas).mean()
-print(f"maxDelta {maxDelta}")
-print(f"meanDelta {meanDelta}")
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        torch.manual_seed(self.settings.seed)
 
-inbetween_dict = npb["inbetween_info"].item()
-corrective_dict = npb["combination_info"].item()
+        # Data and Tensors
+        self.npb_data = None
+        self.A = None
+        self.L = None
+        self.W = None
+        self.Brt = None
+        self.TR = None
+        self.rest_pose = None
+        self.quads = None
+        self.salient_verts = None
+        self.n_bs = 0
+        self.N = 0  # num_vertices
 
-test_anim = np.load("in/test_anim.npz")
-# anim_weights num_frames x num_blendshapes
-# one weight per blendshape per frame
-anim_weights = rl.compute_rig_logic(
-    torch.from_numpy(test_anim["weights"][:, :72]).float(), inbetween_dict, corrective_dict
-).numpy()
+        # Training state
+        self.loss_list = []
+        self.abserr_list = []
 
-num_frames = anim_weights.shape[0]
-print(num_frames, anim_weights.shape[1])
+        logger.info(f"Using device: {self.device}")
+        self._load_data()
+        self._initialize_tensors()
 
-_, B, _ = compBX(Wn, Brt, TR, n_bs, P)
+    def _load_data(self):
+        logger.info(f"Loading data from {self.settings.input_file}...")
+        self.npb_data = np.load(self.settings.input_file, allow_pickle=True)
 
-shapeXforms = B.detach().cpu().numpy()
+        self.n_bs = self.npb_data["deltas"].shape[0]
+        deltas = self.npb_data["deltas"].transpose(1, 0, 2).reshape(-1, self.n_bs * 3).transpose()
+        self.A = torch.from_numpy(deltas).float().to(self.device)
+        self.N = self.A.shape[1]
 
-np.savez(
-    "out/result.npz",
-    rest=npf(rest_pose[:, :3]),
-    quads=quads,
-    weights=npf(Wn).transpose(),
-    restXform=np.array([np.eye(3, 4)] * P),
-    shapeXform=shapeXforms,
-)
+        self.quads = self.npb_data["rest_faces"]
+        rest = self.npb_data["rest_verts"]
+        self.salient_verts = self.npb_data.get("salient_verts")
 
-for i in range(num_frames):
-    T = generateXforms(anim_weights[i, :], shapeXforms)
-    X = npf((Wn.unsqueeze(2) * rest_pose).permute(0, 2, 1).reshape(4 * P, -1))
-    anim_verts = T @ X
-    igl.write_obj(f"out/anim_frame{i:05d}.obj", anim_verts.transpose(), quads)
+        logger.info(f"Loaded model with {self.N} vertices and {self.n_bs} blendshapes.")
+
+        # Laplacian
+        adj = igl.adjacency_matrix(self.quads)
+        adj_diag = np.array(np.sum(adj, axis=1)).squeeze()
+        Lg = sp.sparse.diags(1 / adj_diag) @ (adj - sp.sparse.diags(adj_diag))
+        self.L = torch.from_numpy((Lg).todense()).float().to(self.device).to_sparse()
+
+        # Rest pose
+        rest_centered = rest - rest.mean(axis=0)
+        self.rest_pose = torch.from_numpy(add_homog_coordinate(rest_centered, 1)).float().to(self.device)
+
+    def _initialize_tensors(self):
+        logger.info("Initializing tensors for optimization...")
+        self.TR = buildTR(self.device)
+        self.Brt = ((self.settings.init_weight * torch.randn((6, self.n_bs, self.settings.p_bones, 1, 1)))
+                    .clone()
+                    .float()
+                    .to(self.device)
+                    .requires_grad_())
+        self.W = (1e-8 * torch.randn(self.settings.p_bones, self.N)).clone().float().to(self.device).requires_grad_()
+
+    def _train_pass(self, num_iter, optimizer, normalizeW=False):
+        st = time.time()
+        for i in range(num_iter):
+            Wn = self.W / self.W.sum(axis=0) if normalizeW else self.W
+            BX, _, _ = compBX(Wn, self.Brt, self.TR, self.n_bs, self.settings.p_bones, self.rest_pose)
+            weighed_error = BX - self.A
+
+            if self.settings.beta is not None and self.salient_verts is not None:
+                weighed_error[:, self.salient_verts] *= self.settings.beta
+
+            loss = weighed_error.pow(self.settings.power).mean().pow(2 / self.settings.power)
+            if self.settings.alpha is not None:
+                loss += self.settings.alpha * (self.L @ (BX).transpose(0, 1)).pow(2).mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                Wcutoff = torch.topk(self.W, self.settings.max_influences + 1, dim=0).values[-1, :]
+                Wmask = self.W > Wcutoff
+                Wpruned = Wmask * self.W
+                self.W.copy_(Wpruned)
+                self.W.clamp_(min=0)
+
+                Bdecider = self.Brt.abs()
+                Bcutoff = torch.topk(Bdecider.flatten(), self.settings.total_nnz_brt).values[-1]
+                Bmask = Bdecider >= Bcutoff
+                Bpruned = Bmask * self.Brt
+                self.Brt.copy_(Bpruned)
+
+            if i % 200 == 0:
+                BX, _, _ = compBX(Wn, self.Brt, self.TR, self.n_bs, self.settings.p_bones, self.rest_pose)
+                trunc_err = (BX - self.A).abs().max().item()
+
+                if self.device == "cuda":
+                    torch.cuda.synchronize()
+
+                logger.info(
+                    f"{i:05d}({time.time() - st:.3f}) loss={loss.item():.5e} err={trunc_err:.5e} "
+                    f"B_nnz={(self.Brt.abs() > 1e-4).count_nonzero().item()} W_nnz={(self.W.abs() > 1e-4).count_nonzero().item()}")
+                self.loss_list.append(loss.item())
+                self.abserr_list.append(trunc_err)
+                st = time.time()
+
+    def train(self):
+        param_list = [self.Brt, self.W]
+        logger.info("--- First training pass ---")
+        optimizer1 = torch.optim.Adam(param_list, lr=self.settings.lr, betas=(0.9, 0.9))
+        self._train_pass(self.settings.iter1, optimizer1, normalizeW=False)
+        logger.info("--- Second training pass (with weight normalization) ---")
+        optimizer2 = torch.optim.Adam(param_list, lr=self.settings.lr, betas=(0.9, 0.9))
+        self._train_pass(self.settings.iter2, optimizer2, normalizeW=True)
+        logger.info("Training finished.")
+
+    def save_results(self):
+        logger.info("--- Evaluating and Saving Results ---")
+        Wn = self.W / self.W.sum(axis=0)
+        logger.info(f"Final weight range: min={Wn.min().item()}, max={Wn.max().item()}")
+
+        BX, B, _ = compBX(Wn, self.Brt, self.TR, self.n_bs, self.settings.p_bones, self.rest_pose)
+        orig_deltas = npf(self.A.transpose(1, 0).reshape(-1, self.n_bs, 3))
+        our_deltas = npf(BX.transpose(1, 0).reshape(-1, self.n_bs, 3))
+
+        maxDelta = np.abs(orig_deltas - our_deltas).max()
+        meanDelta = np.abs(orig_deltas - our_deltas).mean()
+        logger.info(f"Max reconstruction delta: {maxDelta}")
+        logger.info(f"Mean reconstruction delta: {meanDelta}")
+
+        shapeXforms = B.detach().cpu().numpy()
+
+        if not os.path.exists(self.settings.output_dir):
+            os.makedirs(self.settings.output_dir)
+
+        output_path = os.path.join(self.settings.output_dir, "result.npz")
+        np.savez(output_path,
+                 rest=npf(self.rest_pose[:, :3]),
+                 quads=self.quads,
+                 weights=npf(Wn).transpose(),
+                 restXform=np.array([np.eye(3, 4)] * self.settings.p_bones),
+                 shapeXform=shapeXforms,)
+        logger.info(f"Result saved to {output_path}")
+
+
+if __name__ == "__main__":
+    npz_path = constants.in_directory.rglob("*.npz")
+    for path in npz_path:
+        face_name = path.stem
+        settings = Settings(input_file=path, output_dir=constants.out_directory / face_name)
+
+        try:
+            logger.info(f"--- Starting Programmatic Compressed Skinning Training for {face_name} ---")
+            trainer = Trainer(settings)
+            trainer.train()
+            trainer.save_results()
+            logger.info("--- Training of {face_name} finished successfully ---")
+            logger.info(f"Results saved in: {os.path.join(settings.output_dir, 'result.npz')}")
+        except Exception as e:
+            logger.exception("An error occurred during training")

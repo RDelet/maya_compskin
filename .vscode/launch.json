@@ -1,0 +1,24 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Module",
+            "type": "python",
+            "request": "launch",
+            "module": "maya_compskin.model_fit",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}/.."
+        },
+        {
+            "name": "Python: Current File (with PYTHONPATH)",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/.."
+            },
+            "justMyCode": true
+        }
+    ]
+}
