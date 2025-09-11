@@ -92,37 +92,6 @@ def npf(T):
     return T.detach().cpu().numpy()
 
 
-def generateXforms(weights, shapeXforms):
-    # weights ... (num_shapes, 1), output of riglogic
-    # shapeXforms ... (3*num_shapes, 4*num_proxy_bones) matrix
-    # returns: (num_proxy_bones, 3, 4) skinning transforms, input to skinCluster
-
-    nShapes = weights.shape[0]
-    nBones = shapeXforms.shape[1] // 4
-    Z = weights.reshape(1, 1, nShapes) * np.dstack([np.eye(3)] * nShapes)
-    # Z:
-    # ┌      ┐┌      ┐┌      ┐
-    # │w₁   0││w₂   0││w₃   0│
-    # │  w₁  ││  w₂  ││  w₃  │  ───▶ axis 2
-    # │0   w₁││0   w₂││0   w₃│
-    # └      ┘└      ┘└      ┘
-    #
-    # Z.transpose(0, 2, 1).reshape(3, -1)
-    # ┌                  ┐
-    # │w₁0 0 w₂0 0 w₃0 0 │
-    # │0 w₁0 0 w₂0 0 w₃0 │
-    # │0 0 w₁0 0 w₂0 0 w₃│
-    # └                  ┘
-    # Z.transpose(0, 2, 1).reshape(3, -1) @ shapeXforms
-    #   weighted sum of blendshape transfomrs (3, 4 * num_bones)
-    #
-    # Z.transpose(0, 2, 1).reshape(3, -1) @ shapeXforms + np.array([np.eye(3, 4)] * nBones).transpose(1, 0, 2).reshape(3, -1)
-    #   add 1 to diagonals for every transform (befor was 0)
-    res = Z.transpose(0, 2, 1).reshape(3, -1) @ shapeXforms + np.array([np.eye(3, 4)] * nBones).transpose(1, 0, 2).reshape(3, -1)
-
-    return res
-
-
 @dataclass
 class Settings:
     input_file: str
@@ -132,7 +101,6 @@ class Settings:
     total_nnz_brt: int = 6000
     power: int = 2
     alpha: float = 10.0
-    beta: Optional[float] = None
     lr: float = 1e-3
     iter1: int = 10000
     iter2: int = 10000
@@ -157,7 +125,6 @@ class Trainer:
         self.TR = None
         self.rest_pose = None
         self.quads = None
-        self.salient_verts = None
         self.n_bs = 0
         self.N = 0  # num_vertices
 
@@ -180,13 +147,17 @@ class Trainer:
 
         self.quads = self.npb_data["rest_faces"]
         rest = self.npb_data["rest_verts"]
-        self.salient_verts = self.npb_data.get("salient_verts")
 
         logger.info(f"Loaded model with {self.N} vertices and {self.n_bs} blendshapes.")
 
         # Laplacian
         adj = igl.adjacency_matrix(self.quads)
         adj_diag = np.array(np.sum(adj, axis=1)).squeeze()
+        # Rigidness Laplacian regularization.
+        # ⎧-1        if k = i
+        # ⎨1/|N(i)|, if k ∈ N(i)
+        # ⎩0         otherwise.
+        # Where N(i) denotes all the 1-ring neighbours of i
         Lg = sp.sparse.diags(1 / adj_diag) @ (adj - sp.sparse.diags(adj_diag))
         self.L = torch.from_numpy((Lg).todense()).float().to(self.device).to_sparse()
 
@@ -210,9 +181,6 @@ class Trainer:
             Wn = self.W / self.W.sum(axis=0) if normalizeW else self.W
             BX, _, _ = compBX(Wn, self.Brt, self.TR, self.n_bs, self.settings.p_bones, self.rest_pose)
             weighed_error = BX - self.A
-
-            if self.settings.beta is not None and self.salient_verts is not None:
-                weighed_error[:, self.salient_verts] *= self.settings.beta
 
             loss = weighed_error.pow(self.settings.power).mean().pow(2 / self.settings.power)
             if self.settings.alpha is not None:
@@ -242,9 +210,8 @@ class Trainer:
                 if self.device == "cuda":
                     torch.cuda.synchronize()
 
-                logger.info(
-                    f"{i:05d}({time.time() - st:.3f}) loss={loss.item():.5e} err={trunc_err:.5e} "
-                    f"B_nnz={(self.Brt.abs() > 1e-4).count_nonzero().item()} W_nnz={(self.W.abs() > 1e-4).count_nonzero().item()}")
+                logger.info(f"{i:05d}({time.time() - st:.3f}) loss={loss.item():.5e} err={trunc_err:.5e} "
+                            f"B_nnz={(self.Brt.abs() > 1e-4).count_nonzero().item()} W_nnz={(self.W.abs() > 1e-4).count_nonzero().item()}")
                 self.loss_list.append(loss.item())
                 self.abserr_list.append(trunc_err)
                 st = time.time()
@@ -284,15 +251,18 @@ class Trainer:
                  quads=self.quads,
                  weights=npf(Wn).transpose(),
                  restXform=np.array([np.eye(3, 4)] * self.settings.p_bones),
-                 shapeXform=shapeXforms,)
+                 shapeXform=shapeXforms)
         logger.info(f"Result saved to {output_path}")
 
 
 if __name__ == "__main__":
+    alphaValues = {"aura": 10, "jupiter": 10, "proteus": 50, "bowen": 50}
     npz_path = constants.in_directory.rglob("*.npz")
     for path in npz_path:
         face_name = path.stem
-        settings = Settings(input_file=path, output_dir=constants.out_directory / face_name)
+        settings = Settings(input_file=path,
+                            output_dir=constants.out_directory / face_name,
+                            alpha=alphaValues.get(face_name, 10))
 
         try:
             logger.info(f"--- Starting Programmatic Compressed Skinning Training for {face_name} ---")
@@ -303,3 +273,12 @@ if __name__ == "__main__":
             logger.info(f"Results saved in: {os.path.join(settings.output_dir, 'result.npz')}")
         except Exception as e:
             logger.exception("An error occurred during training")
+
+"""
+# Test data
+for i in range(num_frames):
+    T = generateXforms(anim_weights[i, :], shapeXforms)
+    X = npf((Wn.unsqueeze(2) * rest_pose).permute(0, 2, 1).reshape(4 * P, -1))
+    anim_verts = T @ X
+    igl.write_obj(f"out/anim_frame{i:05d}.obj", anim_verts.transpose(), quads)
+"""

@@ -19,22 +19,34 @@ def add_homog_coordinate(M, dim):
 
 
 def generateXforms(weights, shapeXforms):
-    """
-    Calcule les transformations finales des os/joints en appliquant les poids des blendshapes.
-    - weights: (num_shapes, 1), poids d'activation pour chaque blendshape (la pose).
-    - shapeXforms: (3*num_shapes, 4*num_proxy_bones), les deltas de transformation appris.
-    """
+    # weights ... (num_shapes, 1), output of riglogic
+    # shapeXforms ... (3*num_shapes, 4*num_proxy_bones) matrix
+    # returns: (num_proxy_bones, 3, 4) skinning transforms, input to skinCluster
     nShapes = weights.shape[0]
     nBones = shapeXforms.shape[1] // 4
-    
-    # Pondère les matrices de transformation de chaque blendshape par son poids d'activation
     Z = weights.reshape(1, 1, nShapes) * np.dstack([np.eye(3)] * nShapes)
-    
-    # Somme les transformations pondérées et ajoute la transformation identité
+    # Z:
+    # ┌      ┐┌      ┐┌      ┐
+    # │w₁   0││w₂   0││w₃   0│
+    # │  w₁  ││  w₂  ││  w₃  │  ───▶ axis 2
+    # │0   w₁││0   w₂││0   w₃│
+    # └      ┘└      ┘└      ┘
+    #
+    # Z.transpose(0, 2, 1).reshape(3, -1)
+    # ┌                  ┐
+    # │w₁0 0 w₂0 0 w₃0 0 │
+    # │0 w₁0 0 w₂0 0 w₃0 │
+    # │0 0 w₁0 0 w₂0 0 w₃│
+    # └                  ┘
+    # Z.transpose(0, 2, 1).reshape(3, -1) @ shapeXforms
+    #   weighted sum of blendshape transfomrs (3, 4 * num_bones)
+    #
+    # Z.transpose(0, 2, 1).reshape(3, -1) @ shapeXforms + np.array([np.eye(3, 4)] * nBones).transpose(1, 0, 2).reshape(3, -1)
+    #   add 1 to diagonals for every transform (befor was 0)
     res = Z.transpose(0, 2, 1).reshape(3, -1) @ shapeXforms + np.array(
         [np.eye(3, 4)] * nBones
     ).transpose(1, 0, 2).reshape(3, -1)
-    
+
     return res
 
 
@@ -48,7 +60,8 @@ def buil_skin(mesh_obj: om.MObject, npz_path: str | Path):
     num_blendshapes = shape_xforms.shape[0] // 3
 
     # Compute joint position at frame 0
-    pose_weights = np.random.rand(num_blendshapes) # np.zeros(num_blendshapes, dtype=np.float32)
+    # pose_weights = np.random.rand(num_blendshapes)
+    pose_weights = np.zeros(num_blendshapes, dtype=np.float32)
     bind_pose_transforms = generateXforms(pose_weights, shape_xforms)
     bind_pose_transforms = bind_pose_transforms.reshape(3, 4, num_bones).transpose(2, 0, 1)
 
@@ -56,14 +69,15 @@ def buil_skin(mesh_obj: om.MObject, npz_path: str | Path):
     joints = []
     joint_grp = cmds.createNode("transform", name="JOINTS_GRP")
     for i in range(num_bones):
-        pos = bind_pose_transforms[i][:, 3]
+        transform_3x4 = bind_pose_transforms[i]
+        transform_4x4 = np.vstack([transform_3x4, [0, 0, 0, 1]])
         jnt = cmds.createNode("joint", name=f"proxy_joint_{i}", parent=joint_grp)
-        cmds.xform(jnt, translation=pos, worldSpace=True)
+        cmds.xform(jnt, matrix=transform_4x4.T.flatten().tolist(), worldSpace=True)
         joints.append(jnt)
 
     # Create skin
     skin_obj = utils.create_skin(mesh_obj, joints)
-    utils.set_weights(skin_obj, skin_weights)
+    utils.set_skin_weights(skin_obj, skin_weights)
 
 
 def build_npz(face_name: str):
