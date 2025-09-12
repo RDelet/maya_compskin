@@ -7,7 +7,7 @@ from pathlib import Path
 from maya import cmds
 from maya.api import OpenMaya as om, OpenMayaAnim as oma
 
-from .constants import logger
+from .constants import logger, in_directory, out_directory
 
 __msl = om.MSelectionList()
 
@@ -37,6 +37,22 @@ def read_npz(npz_path: str | Path):
         return np.load(npz_path.as_posix(), allow_pickle=True)
     except:
         raise RuntimeError("Error on read npz file.")
+
+
+def get_in_from_name(file_name: str) -> Path:
+    path = in_directory / f"{file_name}.npz"
+    if not path.exists():
+        raise RuntimeError(f'File "{file_name}.npz" not found !')
+    
+    return path
+
+
+def get_out_from_name(file_name: str) -> Path:
+    path = out_directory / file_name / "result.npz"
+    if not path.exists():
+        raise RuntimeError(f'No result file found for "{file_name}" !')
+    
+    return path
 
 
 # --------------------------------------------------
@@ -196,66 +212,37 @@ def set_skin_weights(skin_obj: om.MObject, weights: np.array, normalize: bool = 
     return skin_fn.setWeights(mesh_path, component, influences_ids, weights, normalize, returnOldWeights=True)
 
 
-# --------------------------------------------------
-# Misc
-# --------------------------------------------------
+def set_blendshape_targets(shape: om.MObject, deltas: np.array) -> om.MObject:
+    bs_obj = create_blendshapes(shape)
+    bs_name = name_of(bs_obj)
 
-def npz_to_mesh(npz_path: Path, build_blendshapes: bool = False):
+    input_target_plug = om.MFnDependencyNode(bs_obj).findPlug("inputTarget", False)
+    input_target_element = input_target_plug.elementByLogicalIndex(0)
+    input_target_group = input_target_element.child(0)
 
-    npz_data = read_npz(npz_path)
-    mesh_name = npz_path.stem
+    single_component = om.MFnSingleIndexedComponent()
+    components = single_component.create(om.MFn.kMeshVertComponent)
+    single_component.addElements(np.arange(len(deltas[0])))
+    components_fn = om.MFnComponentListData()
+    components_obj = components_fn.create()
+    components_fn.add(components)
 
-    # Get data
-    rest_points = om.MPointArray(npz_data.get('rest_verts'))
-    rest_faces = npz_data.get('rest_faces')
-    poly_count = om.MIntArray([len(f) for f in rest_faces])
-    poly_connect = om.MIntArray(rest_faces.ravel())
-    u_values = []
-    v_values = []
+    for i in range(deltas.shape[0]):
+        cmds.setAttr(f"{bs_name}.weight[{i}]", 0.0)
+        cmds.aliasAttr(f"hodor{i}", f'{bs_name}.weight[{i}]')
 
-    # Build mesh
-    mesh_transform = get_object(cmds.createNode("transform", name=mesh_name))
-    mfn_mesh = om.MFnMesh()
-    mesh_obj = mfn_mesh.create(rest_points, poly_count, poly_connect, u_values, v_values, mesh_transform)
-    assign_shader(mesh_obj)
+        input_target_group_element = input_target_group.elementByLogicalIndex(i)
+        input_target_item = input_target_group_element.child(0)
+        input_target_item_element = input_target_item.elementByLogicalIndex(6000)
 
-    mdg_mod = om.MDGModifier()
-    mdg_mod.renameNode(mesh_obj, f"{mesh_name}Shape")
-    mdg_mod.doIt()
+        point_array_data = om.MFnPointArrayData()
+        data_obj = point_array_data.create(om.MPointArray(deltas[i]))
+        input_target_item_element.child(3).setMObject(data_obj)
+
+        input_target_item_element.child(4).setMObject(components_obj)
     
-    if build_blendshapes:
-        deltas = npz_data.get('deltas')
-        if deltas.shape[0] > 0:
-            bs_obj = create_blendshapes(mesh_obj)
-            bs_name = name_of(bs_obj)
-            # Get plug
-            input_target_plug = om.MFnDependencyNode(bs_obj).findPlug("inputTarget", False)
-            input_target_element = input_target_plug.elementByLogicalIndex(0)
-            input_target_group = input_target_element.child(0)
-            # Get components
-            single_component = om.MFnSingleIndexedComponent()
-            components = single_component.create(om.MFn.kMeshVertComponent)
-            single_component.addElements(np.arange(len(deltas[0])))
-            components_fn = om.MFnComponentListData()
-            components_obj = components_fn.create()
-            components_fn.add(components)
-            # Set deltas
-            for i in range(deltas.shape[0]):
-                # Init weight
-                cmds.setAttr(f"{bs_name}.weight[{i}]", 0.0)
-                cmds.aliasAttr(f"hodor{i}", f'{bs_name}.weight[{i}]')
-                # Get target plug
-                input_target_group_element = input_target_group.elementByLogicalIndex(i)
-                input_target_item = input_target_group_element.child(0)
-                input_target_item_element = input_target_item.elementByLogicalIndex(6000)
-                # Set points
-                point_array_data = om.MFnPointArrayData()
-                data_obj = point_array_data.create(om.MPointArray(deltas[i]))
-                input_target_item_element.child(3).setMObject(data_obj)
-                # Set components
-                input_target_item_element.child(4).setMObject(components_obj)
-                
-    return mesh_obj
+    return bs_obj
+
 
 
 """

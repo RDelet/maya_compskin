@@ -1,2 +1,6 @@
 *.pyc
 *.json
+out/aura/result.npz
+out/bowen/result.npz
+out/jupiter/result.npz
+out/proteus/result.npz

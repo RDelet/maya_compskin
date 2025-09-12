@@ -5,7 +5,6 @@ import time
 import igl
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 from .scripts import constants
 from .scripts.constants import logger
@@ -94,6 +93,39 @@ def npf(T):
 
 @dataclass
 class Settings:
+    """!@Brief Trainning settings
+    
+        Base parameters
+            input_file: NPZ file input.
+                rest pose: Orig vertices position
+                polygon data: poly count / poly connect as array [ [0, 2, 4], [3, 5, 7], ... ]
+                              All polygon need to have a same number of vertices.
+                deltas: Shape deltas.
+            output_dir: NPZ output path.
+        
+        Skinning Model Parameters
+            p_bones: Number of proxy bones.
+            max_influences: Max bone influences per vertex.
+            total_nnz_brt: The total number of non-zero values ​​allowed in the transformation matrix.
+                           This is what makes it possible to isolate a deformation to a joint rather than to all the vertices like the SSDR
+        
+        Learning Settings
+            power: corresponds to the mean square error
+                   Changes how error is measured.
+                   Higher power penalizes large errors very heavily, forcing the model to better reproduce fine details, at the potential expense of other aspects.
+            alpha: The weight of the Laplacian regularization term.
+                   This regularization encourages deformations to be "smooth" on the mesh surface.
+                   A high alpha value gives more rigid and smooth deformations, a low value allows more "chaotic" deformations.
+            lr: The "learning rate" of the Adam optimizer.
+                Controls the size of the steps the optimizer takes to minimize the error.
+                Too large a value can cause learning to "explode", too small a value can make it very slow.
+            iter1: The number of iterations for the two training passes without weight normalisation
+            iter2: The number of iterations for the two training passes with weight normalisation
+            seed: Training begins with randomly initialized weights and transformations.
+                  Setting the seed ensures that this randomness is the same on every run, making the results
+            init_weight: Controls the scale of random values ​​used to initialize transformations
+                         Determines whether learning begins with very small or larger initial deformations
+    """
     input_file: str
     output_dir: str
     p_bones: int = 40
@@ -106,7 +138,6 @@ class Settings:
     iter2: int = 10000
     seed: int = 12345
     init_weight: float = 1e-3
-    no_animation: bool = False # Set to True if you don't need the animation .obj files
 
 
 class Trainer:
@@ -262,7 +293,16 @@ if __name__ == "__main__":
         face_name = path.stem
         settings = Settings(input_file=path,
                             output_dir=constants.out_directory / face_name,
-                            alpha=alphaValues.get(face_name, 10))
+                            p_bones=250,
+                            max_influences=8,
+                            total_nnz_brt=6000,
+                            power=2,
+                            alpha=alphaValues.get(face_name, 10),
+                            lr=1e-3,
+                            iter1=10000,
+                            iter2=10000,
+                            seed=12345,
+                            init_weight=1e-3)
 
         try:
             logger.info(f"--- Starting Programmatic Compressed Skinning Training for {face_name} ---")
@@ -273,6 +313,8 @@ if __name__ == "__main__":
             logger.info(f"Results saved in: {os.path.join(settings.output_dir, 'result.npz')}")
         except Exception as e:
             logger.exception("An error occurred during training")
+        
+        break
 
 """
 # Test data
