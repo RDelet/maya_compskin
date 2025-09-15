@@ -3,7 +3,7 @@ import numpy as np
 from pathlib import Path
 from typing import List
 
-from . import utils
+from . import utils, constants
 
 from maya import cmds
 from maya.api import OpenMaya as om
@@ -20,6 +20,13 @@ class Converter:
             raise RuntimeError(f"file not found at: {npz_path}")
         
         self.path = npz_path
+        self._data = utils.read_npz(npz_path)
+    
+    def get(self, key: str) -> np.array:
+        if key not in self._data:
+            raise RuntimeError(f"Key {key} does note xists in {self.npz_path}")
+        
+        return self._data[key]
 
     def _get_output_path(self, npz_path: str | Path, extension: str) -> Path:
         if isinstance(npz_path, str):
@@ -30,9 +37,8 @@ class Converter:
     def to_json(self):
         
         data = {}
-        npz_data = utils.read_npz(self.path)
-        for key in npz_data.keys():
-            array = npz_data[key]
+        for key in self._data.keys():
+            array = self.get[key]
             if array.dtype == 'O':
                 data[key] = array.item()
             else:
@@ -41,18 +47,14 @@ class Converter:
         utils.dump_json(data, self._get_output_path(self.path, '.json'))
     
     def to_mesh(self, build_blendshapes: bool = False) -> om.MObject:
-        
-        npz_data = utils.read_npz(self.path)
-        mesh_name = self.path.stem
-
         # Get data
-        rest_points = om.MPointArray(npz_data.get('rest_verts'))
-        rest_faces = npz_data.get('rest_faces')
+        mesh_name = self.path.stem
+        rest_points = om.MPointArray(self.get('rest_verts'))
+        rest_faces = self.get('rest_faces')
         poly_count = om.MIntArray([len(f) for f in rest_faces])
         poly_connect = om.MIntArray(rest_faces.ravel())
         u_values = []
         v_values = []
-
         # Build mesh
         mesh_transform = utils.get_object(cmds.createNode("transform", name=mesh_name))
         mfn_mesh = om.MFnMesh()
@@ -64,81 +66,78 @@ class Converter:
         mdg_mod.doIt()
         
         if build_blendshapes:
-            deltas = npz_data.get('deltas')
+            deltas = self.get('deltas')
             if deltas.shape[0] > 0:
                 utils.set_blendshape_targets(mesh_obj, deltas)
     
         return mesh_obj
         
     def to_skin(self, shape: om.MObject) -> om.MObject:
-
-        npz_data = utils.read_npz(self.path)
-        rest_vertices = npz_data['rest']
-        skin_weights = npz_data['weights']
+        rest_vertices = self.get("rest")
+        skin_weights = self.get("weights")
         num_bones = skin_weights.shape[1]
 
-        joint_bind_matrices = self._compute_joint_bindpose(num_bones, skin_weights, rest_vertices)
         joint_grp = cmds.createNode("transform", name="JOINTS_GRP")
-        joints = self._create_joints(joint_bind_matrices, parent=joint_grp)
+        joints = self._create_joints(num_bones, parent=joint_grp)
 
         skin_obj = utils.create_skin(shape, joints)
         utils.set_skin_weights(skin_obj, skin_weights)
         
         return skin_obj, joints
     
-    def to_pose(self, joints: List[str]):
-        # ToDO: ...
-        npz_data = utils.read_npz(self.path)
+    def to_anim(self, joints: List[str], shape_xform: np.array):
+        anim_weights = self.get("weights")
+        num_frames = anim_weights.shape[0]
+        target_count = anim_weights.shape[1]
+        num_blendshapes = shape_xform.shape[0] // 3
+        min_target_count = min(target_count, num_blendshapes)
+        
         joint_count = len(joints)
-        shape_xforms = npz_data['shapeXform']
-        num_blendshapes = shape_xforms.shape[0] // 3
         
-        pose_weights = np.random.uniform(0, 1.0, size=num_blendshapes)
-        # pose_weights = np.zeros(num_blendshapes, dtype=np.float32)
-        bind_pose_transforms = self._generateXforms(pose_weights, shape_xforms)
-        bind_pose_transforms = bind_pose_transforms.reshape(3, joint_count, 4).transpose(1, 0, 2)
+        cmds.playbackOptions(minTime=0, maxTime=num_frames, animationStartTime=0, animationEndTime=num_frames)
+        current_time = cmds.currentTime(query=True)
+        cmds.refresh(suspend=True, force=True)
+        try:
+            for i in range(num_frames):
+                cmds.currentTime(i)
+                
+                pose_weights = np.zeros(num_blendshapes, dtype=np.float32)
+                pose_weights[:min_target_count] = anim_weights[i][:min_target_count]
+                xform = self._generateXforms(pose_weights, shape_xform)
+                pose_matrices = xform.reshape(3, joint_count, 4).transpose(1, 0, 2)
+                
+                for j, node in enumerate(joints):
+                    transform_3x4 = pose_matrices[j]
+                    transform_4x4 = np.vstack([transform_3x4, [0, 0, 0, 1]])
+                    matrix = transform_4x4.T.flatten().tolist()
+                    cmds.xform(node, matrix=matrix, worldSpace=True)
 
-        for node in joints:
-            transform_3x4 = bind_pose_transforms[i]
-            transform_4x4 = np.vstack([transform_3x4, [0, 0, 0, 1]])
-            cmds.xform(node, matrix=transform_4x4.T.flatten().tolist(), worldSpace=True)
-            joints.append(node)
+                cmds.setKeyframe(joints)
+        except Exception as e:
+            constants.logger.error(e)
+        finally:
+            cmds.currentTime(current_time)
+            cmds.refresh(suspend=False, force=True)
     
     @staticmethod
-    def _compute_joint_bindpose(num_bones: int, skin_weights: np.array, rest_verts: np.array) -> np.array:
-        joint_bind_matrices = []
-        for i in range(num_bones):
-            bone_weights = skin_weights[:, i]
-            total_weight = np.sum(bone_weights)
-
-            if total_weight > 1e-6:
-                weighted_center = np.average(rest_verts, axis=0, weights=bone_weights)
-            else:
-                weighted_center = np.zeros(3)
-
-            bind_matrix = np.eye(4, dtype=np.float64)
-            bind_matrix[:3, 3] = weighted_center
-            joint_bind_matrices.append(bind_matrix)
-        
-        return np.array(joint_bind_matrices)
-    
-    @staticmethod
-    def _create_joints(matrices: np.array, parent: str = None) -> List[str]:
+    def _create_joints(num_joints, parent: str = None) -> List[str]:
         joints = []
-        for i in range(matrices.shape[0]):
+        for i in range(num_joints):
             jnt = cmds.createNode("joint", name=f"proxy_joint_{i}", parent=parent)
-            cmds.xform(jnt, matrix=matrices[i].T.flatten().tolist(), worldSpace=True)
+            cmds.xform(jnt, matrix=utils.identity_matrix, worldSpace=True)
+            cmds.setAttr(f"{jnt}.bindPose", utils.identity_matrix, type="matrix")
             joints.append(jnt)
         
         return joints
     
+    @staticmethod
     def _add_homog_coordinate(M, dim):
         x = list(M.shape)
         x[dim] = 1
 
         return np.concatenate([M, np.ones(x)], axis=dim).astype(M.dtype)
 
-
+    @staticmethod
     def _generateXforms(weights, shapeXforms):
         # weights ... (num_shapes, 1), output of riglogic
         # shapeXforms ... (3*num_shapes, 4*num_proxy_bones) matrix
@@ -184,10 +183,40 @@ cmds.file(new=True, force=True)
 
 aura_in = utils.get_in_from_name("aura")
 aura_out = utils.get_out_from_name("aura")
+test_anim = utils.get_in_from_name("test_anim")
 
 in_converter = converter.Converter(aura_in)
 shape_obj = in_converter.to_mesh()
-# shape_obj = in_converter.to_mesh(build_blendshapes=True)
 out_converter = converter.Converter(aura_out)
 skin_obj, joints = out_converter.to_skin(shape_obj)
+
+anim_converter = converter.Converter(test_anim)
+anim_converter.to_anim(joints, out_converter.get("shapeXform"))
+"""
+
+"""
+# apply weights on blendshape to compare animation
+
+in_converter = converter.Converter(aura_in)
+shape_bs_obj = in_converter.to_mesh(build_blendshapes=True)
+bs_node = utils.find_deformer(shape_bs_obj, om.MFn.kBlendShape)
+bs_node_name = utils.name_of(bs_node[0])
+
+anim_converter = converter.Converter(test_anim)
+weights = anim_converter.get("weights")
+num_frame = weights.shape[0]
+num_target = weights.shape[1]
+current_time = cmds.currentTime(query=True)
+cmds.refresh(suspend=True, force=True)
+try:
+    for i in range(num_frame):
+        cmds.currentTime(i)
+        for j in range(num_target):
+            cmds.setAttr(f"{bs_node_name}.weight[{j}]", float(weights[i][j]))
+        cmds.setKeyframe(bs_node_name)
+except Exception as e:
+    cmds.error(e)
+finally:
+    cmds.currentTime(current_time)
+    cmds.refresh(suspend=False, force=True)
 """

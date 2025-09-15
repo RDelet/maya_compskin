@@ -287,22 +287,22 @@ class Trainer:
 
 
 if __name__ == "__main__":
-    alphaValues = {"aura": 10, "jupiter": 10, "proteus": 50, "bowen": 50}
     npz_path = constants.in_directory.rglob("*.npz")
     for path in npz_path:
         face_name = path.stem
+
         settings = Settings(input_file=path,
                             output_dir=constants.out_directory / face_name,
                             p_bones=250,
                             max_influences=8,
-                            total_nnz_brt=6000,
-                            power=2,
-                            alpha=alphaValues.get(face_name, 10),
-                            lr=1e-3,
-                            iter1=10000,
-                            iter2=10000,
+                            total_nnz_brt=10000,
+                            power=12,
+                            alpha=50,
+                            lr=1e-5,
+                            iter1=20000,
+                            iter2=20000,
                             seed=12345,
-                            init_weight=1e-3)
+                            init_weight=1e-6)
 
         try:
             logger.info(f"--- Starting Programmatic Compressed Skinning Training for {face_name} ---")
@@ -316,8 +316,41 @@ if __name__ == "__main__":
         
         break
 
+
 """
-# Test data
+# Launch training from maya
+from maya_compskin import model_fit
+
+
+npz_path = utils.get_in_from_name("aura")
+face_name = path.stem
+
+settings = model_fit.Settings(input_file=path,
+                              output_dir=constants.out_directory / face_name,
+                              p_bones=20,
+                              max_influences=8,
+                              total_nnz_brt=6000,
+                              power=2,
+                              alpha=50,
+                              lr=1e-3,
+                              iter1=20000,
+                              iter2=20000,
+                              seed=12345,
+                              init_weight=1e-6)
+
+try:
+    logger.info(f"--- Starting Programmatic Compressed Skinning Training for {face_name} ---")
+    trainer = model_fit.Trainer(settings)
+    trainer.train()
+    trainer.save_results()
+    logger.info("--- Training of {face_name} finished successfully ---")
+    logger.info(f"Results saved in: {os.path.join(settings.output_dir, 'result.npz')}")
+except Exception as e:
+    logger.exception("An error occurred during training")
+"""
+
+"""
+# ToDo: Test data
 for i in range(num_frames):
     T = generateXforms(anim_weights[i, :], shapeXforms)
     X = npf((Wn.unsqueeze(2) * rest_pose).permute(0, 2, 1).reshape(4 * P, -1))

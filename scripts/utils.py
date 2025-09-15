@@ -9,7 +9,12 @@ from maya.api import OpenMaya as om, OpenMayaAnim as oma
 
 from .constants import logger, in_directory, out_directory
 
+
 __msl = om.MSelectionList()
+identity_matrix = [1.0, 0.0, 0.0, 0.0,
+                   0.0, 1.0, 0.0, 0.0,
+                   0.0, 0.0, 1.0, 0.0,
+                   0.0, 0.0, 0.0, 1.0]
 
 
 # --------------------------------------------------
@@ -184,9 +189,8 @@ def create_skin(mesh_obj: om.MObject, influences: list) -> om.MObject:
     deformer_name = name_of(deformer)
     
     for i, influence in enumerate(influences):
-        matrix = om.MMatrix(cmds.xform(influence, query=True, matrix=True, worldSpace=True))
         cmds.connectAttr(f"{influence}.worldMatrix[0]", f"{deformer_name}.matrix[{i}]", force=True)
-        cmds.setAttr(f"{deformer_name}.bindPreMatrix[{i}]", matrix.inverse(), type="matrix")
+        cmds.setAttr(f"{deformer_name}.bindPreMatrix[{i}]", identity_matrix, type="matrix")
     
     return deformer
 
