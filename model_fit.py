@@ -286,10 +286,14 @@ class Trainer:
         logger.info(f"Result saved to {output_path}")
 
 
+"""
+# Launch training from python on all npz
 if __name__ == "__main__":
     npz_path = constants.in_directory.rglob("*.npz")
     for path in npz_path:
         face_name = path.stem
+        if face_name == "test_anim":
+            continue
 
         settings = Settings(input_file=path,
                             output_dir=constants.out_directory / face_name,
@@ -313,8 +317,7 @@ if __name__ == "__main__":
             logger.info(f"Results saved in: {os.path.join(settings.output_dir, 'result.npz')}")
         except Exception as e:
             logger.exception("An error occurred during training")
-        
-        break
+"""
 
 
 """
