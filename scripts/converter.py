@@ -24,7 +24,7 @@ class Converter:
     
     def get(self, key: str) -> np.array:
         if key not in self._data:
-            raise RuntimeError(f"Key {key} does note xists in {self.npz_path}")
+            raise RuntimeError(f"Key {key} does not exist in {self.path}")
         
         return self._data[key]
 
@@ -38,7 +38,7 @@ class Converter:
         
         data = {}
         for key in self._data.keys():
-            array = self.get[key]
+            array = self.get(key)
             if array.dtype == 'O':
                 data[key] = array.item()
             else:

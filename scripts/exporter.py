@@ -98,12 +98,14 @@ class Exporter:
             fn_comp_data = om.MFnComponentListData(input_target_item_element.child(4).asMObject())
             components = []
             for i in range(fn_comp_data.length()):
-                fn_single = om.MFnSingleIndexedComponent(fn_comp_data.get(0))
+                fn_single = om.MFnSingleIndexedComponent(fn_comp_data.get(i))
                 components.extend(fn_single.getElements())
 
             if len(components) == 0:
                 continue
             deltas[i][np.array(components)] = np.array(fn_point_data.array())[:, :3]
+        
+        return deltas
 
 
 """

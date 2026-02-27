@@ -67,9 +67,12 @@ def compBX(Wn, Brt, TR, n_bs, P, rest_pose):
     # boneP  w│           │
     #         └           ┘
     X = (Wn.unsqueeze(2) * rest_pose).permute(0, 2, 1).reshape(4 * P, -1)
+    """
     B = Brt[0, ...] * TR[0]
     for i in range(1, 6):
         B += Brt[i, ...] * TR[i]
+    """
+    B = (Brt * TR).sum(dim=0)
     B = B.permute(0, 2, 1, 3).reshape(n_bs * 3, P * 4)
     # B current bone transforms
     #               bone 0... bone N
@@ -209,6 +212,8 @@ class Trainer:
     def _train_pass(self, num_iter, optimizer, normalizeW=False):
         st = time.time()
         for i in range(num_iter):
+            col_sums = self.W.sum(axis=0).clamp(min=1e-8)
+            Wn = self.W / col_sums
             Wn = self.W / self.W.sum(axis=0) if normalizeW else self.W
             BX, _, _ = compBX(Wn, self.Brt, self.TR, self.n_bs, self.settings.p_bones, self.rest_pose)
             weighed_error = BX - self.A
@@ -259,7 +264,8 @@ class Trainer:
 
     def save_results(self):
         logger.info("--- Evaluating and Saving Results ---")
-        Wn = self.W / self.W.sum(axis=0)
+        col_sums = self.W.sum(axis=0).clamp(min=1e-8)
+        Wn = self.W / col_sums
         logger.info(f"Final weight range: min={Wn.min().item()}, max={Wn.max().item()}")
 
         BX, B, _ = compBX(Wn, self.Brt, self.TR, self.n_bs, self.settings.p_bones, self.rest_pose)
