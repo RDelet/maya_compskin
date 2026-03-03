@@ -2,12 +2,14 @@ from pathlib import Path
 from typing import Tuple
 import numpy as np
 
-from . import utils
-from .constants import logger
+from maya_compskin.maya import maya_utils
+from maya_compskin.core.constants import logger
 
 from maya import cmds
 from maya.api import OpenMaya as om
 
+
+"""TODO: Refacto and test. Deprecated for this moment"""
 
 class Exporter:
     
@@ -17,7 +19,7 @@ class Exporter:
         if not cmds.nodeType(mesh_name) == "mesh":
             raise RuntimeError(f"Node {mesh_name} is not a mesh !")
 
-        self._handle = om.MObjectHandle(utils.get_object(mesh_name))
+        self._handle = om.MObjectHandle(maya_utils.get_object(mesh_name))
         self._mesh_fn = om.MFnMesh(self.shape)
     
     @property
@@ -57,7 +59,7 @@ class Exporter:
         raise NotImplementedError("Export mesh from rig not implemented yet !")
 
     def _get_mesh_data(self) -> Tuple[np.array, np.array]:
-        logger.info(f"Get mesh data from {utils.name_of(self.shape)}")
+        logger.info(f"Get mesh data from {maya_utils.name_of(self.shape)}")
         rest_vertices = np.array(self._mesh_fn.getPoints(om.MSpace.kObject))
         triangle_counts, triangle_vertices = self._mesh_fn.getTriangles()
 
@@ -75,12 +77,12 @@ class Exporter:
         return rest_vertices, np.array(triangles)
 
     def _get_delta_from_blendshape(self) -> np.array:
-        logger.info(f"Get blendshape data from {utils.name_of(self.shape)}")
-        deformers = utils.find_deformer(self.shape, om.MFn.kBlendShape)
+        logger.info(f"Get blendshape data from {maya_utils.name_of(self.shape)}")
+        deformers = maya_utils.find_deformer(self.shape, om.MFn.kBlendShape)
         if not deformers:
-            raise RuntimeError(f"No blendshape found on {utils.name_of(self.shape)}")
+            raise RuntimeError(f"No blendshape found on {maya_utils.name_of(self.shape)}")
         if len(deformers) != 1:
-            raise RuntimeError(f"Multi blendshape found on {utils.name_of(self.shape)}")
+            raise RuntimeError(f"Multi blendshape found on {maya_utils.name_of(self.shape)}")
         bs_obj = deformers[0]
         vtx_count = self._mesh_fn.numVertices
 
@@ -106,18 +108,3 @@ class Exporter:
             deltas[i][np.array(components)] = np.array(fn_point_data.array())[:, :3]
         
         return deltas
-
-
-"""
-import imp
-
-from maya_compskin.scripts import exporter
-imp.reload(exporter)
-from maya_compskin.scripts.exporter import Exporter
-from maya_compskin.scripts import constants
-
-output_path = constants.in_directory / "Jin.npz"
-exporter = Exporter("_MESH_:JIN_HEADShape")
-rest_vertices, rest_faces, deltas = exporter.from_blendshape()
-exporter.dump(output_path.as_posix(), rest_vertices=rest_vertices, rest_faces=rest_faces, deltas=deltas)
-"""

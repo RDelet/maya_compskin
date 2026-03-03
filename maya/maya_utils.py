@@ -1,68 +1,18 @@
 from __future__ import annotations
 
-import json
+import math
+from typing import List
+
 import numpy as np
-from pathlib import Path
 
 from maya import cmds
 from maya.api import OpenMaya as om, OpenMayaAnim as oma
 
-from .constants import logger, in_directory, out_directory
+from ..core.constants import logger
 
 
 __msl = om.MSelectionList()
-identity_matrix = [1.0, 0.0, 0.0, 0.0,
-                   0.0, 1.0, 0.0, 0.0,
-                   0.0, 0.0, 1.0, 0.0,
-                   0.0, 0.0, 0.0, 1.0]
 
-
-# --------------------------------------------------
-# File
-# --------------------------------------------------
-
-def dump_json(data: dict, output_path: str | Path):
-    if isinstance(output_path, str):
-        output_path = Path(output_path)
-    
-    try:
-        with open(output_path.as_posix(), 'w') as f:
-            json.dump(data, f, indent=4)
-        logger.debug(f"Successfully saved JSON to '{output_path.as_posix()}'")
-    except Exception:
-        raise RuntimeError("Failed to write JSON file.")
-
-
-def read_npz(npz_path: str | Path):
-    if isinstance(npz_path, str):
-        npz_path = Path(npz_path)
-    
-    try:
-        logger.info(f"Read npz file: '{npz_path.as_posix()}'.")
-        return np.load(npz_path.as_posix(), allow_pickle=True)
-    except:
-        raise RuntimeError("Error on read npz file.")
-
-
-def get_in_from_name(file_name: str) -> Path:
-    path = in_directory / f"{file_name}.npz"
-    if not path.exists():
-        raise RuntimeError(f'File "{file_name}.npz" not found !')
-    
-    return path
-
-
-def get_out_from_name(file_name: str) -> Path:
-    path = out_directory / file_name / "result.npz"
-    if not path.exists():
-        raise RuntimeError(f'No result file found for "{file_name}" !')
-    
-    return path
-
-
-# --------------------------------------------------
-# Maya
-# --------------------------------------------------
 
 def name_of(node: om.MObject | om.MDagPath) -> str:
     if isinstance(node, om.MObject):
@@ -189,8 +139,10 @@ def create_skin(mesh_obj: om.MObject, influences: list) -> om.MObject:
     deformer_name = name_of(deformer)
     
     for i, influence in enumerate(influences):
+        matrix = np.array(cmds.xform(influence, query=True, matrix=True, worldSpace=True))
+        inv_matrix = np.linalg.inv(matrix.reshape(4, 4)).flatten()
         cmds.connectAttr(f"{influence}.worldMatrix[0]", f"{deformer_name}.matrix[{i}]", force=True)
-        cmds.setAttr(f"{deformer_name}.bindPreMatrix[{i}]", identity_matrix, type="matrix")
+        cmds.setAttr(f"{deformer_name}.bindPreMatrix[{i}]", inv_matrix.tolist(), type="matrix")
     
     return deformer
 
@@ -233,7 +185,7 @@ def set_blendshape_targets(shape: om.MObject, deltas: np.array) -> om.MObject:
 
     for i in range(deltas.shape[0]):
         cmds.setAttr(f"{bs_name}.weight[{i}]", 0.0)
-        cmds.aliasAttr(f"hodor{i}", f'{bs_name}.weight[{i}]')
+        cmds.aliasAttr(f"target_{i}", f'{bs_name}.weight[{i}]')
 
         input_target_group_element = input_target_group.elementByLogicalIndex(i)
         input_target_item = input_target_group_element.child(0)
@@ -248,10 +200,70 @@ def set_blendshape_targets(shape: om.MObject, deltas: np.array) -> om.MObject:
     return bs_obj
 
 
+def srt_from_matrix(matrix: list | tuple | om.MMatrix) -> List[List[float], List[float], List[float]]:
+    if not isinstance(matrix, om.MMatrix):
+        matrix = om.MMatrix(matrix)
+    
+    transformation = om.MTransformationMatrix(matrix)
+    
+    scale = transformation.scale(om.MSpace.kWorld)
+    rotate = [math.degrees(x) for x in transformation.rotation()]
+    translate = transformation.translation(om.MSpace.kWorld)
 
-"""
-from maya_compskin.scripts import utils, constants
+    return scale, rotate, translate
 
-npz_path = constants.in_directory / "aura.npz"
-utils.npz_to_mesh(npz_path, build_blendshapes=False)
-"""
+
+def current_time(current) -> int:
+    return cmds.currentTime(current)
+
+
+def get_animation_end() -> int:
+    return int(cmds.playbackOptions(query=True, animationEndTime=True))
+
+
+def get_animation_start() -> int:
+    return int(cmds.playbackOptions(query=True, animationStartTime=True))
+
+
+def create_animation(node: str | om.MObject, attr: str, keys: List[float]) -> om.MObject:
+    if isinstance(node, str):
+        node = get_object(node)
+
+    try:
+        plug = om.MFnDependencyNode(node).findPlug(attr, False)
+    except Exception as e:
+        logger.error(f"Attribute {attr} does not exists on {name_of(node)} !")
+        raise e
+    
+    start_frame = int(get_animation_start())
+    curve_fn = oma.MFnAnimCurve()
+    curve_obj = curve_fn.create(plug)
+    k_linear = curve_fn.kTangentLinear
+    times = [start_frame + i for i in range(len(keys))]
+    curve_fn.addKeysWithTangents(times, keys, tangentInType=k_linear, tangentOutType=k_linear)
+
+    return curve_obj
+
+
+def anim_from_matrice(node: str | om.MObect, anim_matrices: List[om.MMatrix]) -> List[om.MObject]:
+    anim_data = {"sx": [], "sy": [], "sz": [],
+                 "rx": [], "ry": [], "rz": [],
+                 "tx": [], "ty": [], "tz": []}
+
+    for matrix in anim_matrices:
+        scale, rotate, translate = srt_from_matrix(matrix)
+        anim_data["sx"].append(scale[0])
+        anim_data["sy"].append(scale[1])
+        anim_data["sz"].append(scale[2])
+        anim_data["rx"].append(rotate[0])
+        anim_data["ry"].append(rotate[1])
+        anim_data["rz"].append(rotate[2])
+        anim_data["tx"].append(translate[0])
+        anim_data["ty"].append(translate[1])
+        anim_data["tz"].append(translate[2])
+    
+    output = []
+    for attr, keys in anim_data.items():
+        output.append(create_animation(node, attr, keys))
+    
+    return output
