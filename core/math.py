@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.sparse import lil_matrix
 import torch
+from typing import Optional, List
 
 
 def compute_initial_weights(rest_verts: np.ndarray, joint_positions: np.ndarray, max_influences: int = 8) -> np.ndarray:
@@ -22,6 +24,10 @@ def compute_initial_weights(rest_verts: np.ndarray, joint_positions: np.ndarray,
     weights  = weights / row_sums
 
     return weights
+
+
+def get_mask_from_deltas(deltas: np.array, threshold: float = 1e-4):
+    return np.linalg.norm(deltas, axis=-1).mean(axis=0) > threshold
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -213,80 +219,11 @@ def add_homog_coordinate(M, dim):
 # This is exactly the predicted per-vertex displacement for every blendshape,
 # packed as (n_bs*3 rows, N columns).  It is compared to A (same shape) to
 # compute the reconstruction loss.
-"""
-def compBX(Wn, Brt, TR, n_bs, P, rest_pose, joint_positions=None):
-
-    if joint_positions is not None:
-        # ── Express each vertex in the local frame of each joint ──────────
-        #
-        # rest_pose[:, :3]  :  (N, 3)  vertex positions (centred world space)
-        # joint_positions   :  (P, 3)  joint positions  (same centred space)
-        #
-        # We want  v_local[j, v] = v_world[v] - p_j
-        # using broadcasting:
-        pj      = joint_positions.unsqueeze(1)   # (P, 1, 3)  – one pos per bone
-        v_world = rest_pose[:, :3].unsqueeze(0)  # (1, N, 3)  – all vertices
-
-        # Subtract: each bone sees every vertex relative to itself
-        v_local = v_world - pj                   # (P, N, 3)
-
-        # Re-append the homogeneous coordinate (=1) so translation terms in
-        # the (3×4) transform matrix have something to act on.
-        ones = torch.ones(*v_local.shape[:2], 1, device=rest_pose.device)  # (P, N, 1)
-        rest_local = torch.cat([v_local, ones], dim=-1)                     # (P, N, 4)
-
-        # Weight each vertex by the bone's skinning weight, then reshape to
-        # the (4*P, N) layout expected by the matrix product B @ X.
-        #   Wn          : (P, N)    → unsqueeze → (P, N, 1)
-        #   rest_local  : (P, N, 4)
-        #   product     : (P, N, 4)  → permute(0,2,1) → (P, 4, N) → reshape → (4P, N)
-        X = (Wn.unsqueeze(2) * rest_local).permute(0, 2, 1).reshape(4 * P, -1)
-
-    else:
-        # ── Original formulation: joints implicitly at the centred origin ──
-        # Wn         : (P, N) → unsqueeze → (P, N, 1)
-        # rest_pose  : (N, 4) → unsqueeze broadcasts to (P, N, 4)
-        X = (Wn.unsqueeze(2) * rest_pose).permute(0, 2, 1).reshape(4 * P, -1)
-
-    # ── Reconstruct the (3×4) transformation matrices from Brt and TR ──────
-    #
-    # Brt : (6, n_bs, P, 1, 1)  – scalar coefficients, LEARNED
-    # TR  : (6, 1,    1, 3, 4)  – fixed basis matrices
-    #
-    # Element-wise multiply broadcasts to (6, n_bs, P, 3, 4), then we sum
-    # over the 6 DOF dimension to get one (3×4) matrix per (blendshape, bone).
-    #
-    #   B_raw[s, j] = Σ_k  Brt[k, s, j] * TR[k]    shape: (n_bs, P, 3, 4)
-    #
-    # This is the vectorised equivalent of the original loop:
-    #   B = Brt[0]*TR[0]; for i in 1..5: B += Brt[i]*TR[i]
-    B = (Brt * TR).sum(dim=0)            # (n_bs, P, 3, 4)
-
-    # Rearrange from (n_bs, P, 3, 4) to (n_bs*3, P*4) so that the matrix
-    # product B @ X computes all blendshapes simultaneously.
-    #   permute(0,2,1,3) → (n_bs, 3, P, 4)
-    #   reshape           → (n_bs*3, P*4)
-    B = B.permute(0, 2, 1, 3).reshape(n_bs * 3, P * 4)
-
-    # ── BX: predicted vertex displacements ──────────────────────────────────
-    # (n_bs*3, P*4) @ (P*4, N)  =  (n_bs*3, N)
-    # Each column is a vertex; each group of 3 rows is one blendshape (x,y,z).
-    return B @ X, B, X
-"""
-def compBX(Wn, Brt, TR, n_bs, P, rest_pose, joint_positions=None):
-
-    if joint_positions is not None:
-        joint_positions = joint_positions.unsqueeze(1)
-        vertex_world    = rest_pose[:, :3].unsqueeze(0)
-        vertex_local    = vertex_world - joint_positions
-        ones       = torch.ones(*vertex_local.shape[:2], 1, device=rest_pose.device)
-        rest_local = torch.cat([vertex_local, ones], dim=-1)
-        weighted = Wn.unsqueeze(2) * rest_local
-    else:
-        weighted = Wn.unsqueeze(2) * rest_pose
+def compBX(Wn, Brt, TR, n_bs, rest_pose):
+    weighted = Wn.unsqueeze(2) * rest_pose
 
     P_actual = weighted.shape[0]
-    X = weighted.permute(0, 2, 1).reshape(4 * P_actual, -1)  # (4P, N)
+    X = weighted.permute(0, 2, 1).reshape(4 * P_actual, -1)
 
     B = Brt[0, ...] * TR[0]
     for i in range(1, 6):
@@ -331,3 +268,141 @@ def generateXforms(weights, shapeXforms):
         ).transpose(1, 0, 2).reshape(3, -1)
 
         return res
+
+
+def compute_cotangent_laplacian(verts: np.ndarray, faces: np.ndarray):
+    n = len(verts)
+    L = lil_matrix((n, n), dtype=np.float64)
+
+    for tri in faces:
+        i, j, k = tri
+        for vi, vj, opp_idx in [(i, j, 2), (j, k, 0), (k, i, 1)]:
+            v_opp = verts[tri[opp_idx]]
+            ea = verts[vi] - v_opp
+            eb = verts[vj] - v_opp
+            cos_a = np.dot(ea, eb)
+            sin_a = np.linalg.norm(np.cross(ea, eb)) + 1e-12
+            cot = 0.5 * cos_a / sin_a
+            L[vi, vj] -= cot
+            L[vj, vi] -= cot
+            L[vi, vi] += cot
+            L[vj, vj] += cot
+
+    return L.tocsr()
+
+
+def compute_laplacian_curvature(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """
+    Per-vertex mean-curvature magnitude via the cotangent Laplacian.
+    High values indicate creases, folds, and generally non-flat areas.
+    """
+    L = compute_cotangent_laplacian(verts, faces)
+    Lv = L.dot(verts)
+    return np.linalg.norm(Lv, axis=1)
+
+
+def compute_dihedral_score(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """
+    Per-vertex average dihedral angle across all incident edges.
+
+    For each edge shared by exactly two triangles, compute the angle between
+    their face normals (= the dihedral angle). Each vertex accumulates the
+    angles of its incident edges.
+
+    A vertex on a perfectly flat surface has a score of 0.
+    A vertex on a sharp crease has a score close to π.
+    """
+    n_verts = len(verts)
+
+    v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
+    cross  = np.cross(v1 - v0, v2 - v0)
+    face_n = cross / np.maximum(np.linalg.norm(cross, axis=1, keepdims=True), 1e-12)
+
+    edge_to_faces: dict = {}
+    for fi, face in enumerate(faces):
+        for a in range(3):
+            b = (a + 1) % 3
+            key = (min(face[a], face[b]), max(face[a], face[b]))
+            edge_to_faces.setdefault(key, []).append(fi)
+
+    angle_sum = np.zeros(n_verts)
+    angle_count = np.zeros(n_verts)
+
+    for (vi, vj), flist in edge_to_faces.items():
+        if len(flist) == 2:
+            cos_a = np.clip(np.dot(face_n[flist[0]], face_n[flist[1]]), -1.0, 1.0)
+            angle = np.arccos(cos_a)
+            for v in (vi, vj):
+                angle_sum[v] += angle
+                angle_count[v] += 1
+
+    return angle_sum / np.maximum(angle_count, 1)
+
+
+def compute_rest_score(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """
+    Combined per-vertex deformation-importance score in [0, 1].
+    Flat regions score near 0; angular or highly curved regions score near 1.
+    """
+    def normalize(x: np.ndarray) -> np.ndarray:
+        return (x - x.min()) / (x.max() - x.min() + 1e-12)
+
+    curv = normalize(compute_laplacian_curvature(verts, faces))
+    dihed = normalize(compute_dihedral_score(verts, faces))
+
+    return 0.4 * curv + 0.6 * dihed
+
+
+def uniform_biased_fps(verts: np.ndarray, score: np.ndarray, n_joints: int,
+                       feature_weight: float = 2.0,
+                       deform_mask: Optional[np.ndarray] = None,) -> List[int]:
+    """
+    Feature-biased Farthest Point Sampling with optional deformation mask.
+        feature_weight = 0   → pure uniform coverage (score ignored entirely)
+        feature_weight = 1   → angular vertices count as 2× farther than flat
+        feature_weight = 5   → angular vertices count as 6× farther than flat
+        feature_weight = 10  → strongly biased; flat areas only get joints
+                               when no angular vertex is reachable
+    """
+    n = len(verts)
+    if deform_mask is None:
+        mask = np.ones(n, dtype=bool)
+    else:
+        mask = np.asarray(deform_mask, dtype=bool)
+        if mask.shape[0] != n:
+            raise ValueError(
+                f"deform_mask length {mask.shape[0]} does not match "
+                f"vertex count {n}."
+            )
+
+    eligible_indices = np.where(mask)[0]
+    if len(eligible_indices) == 0:
+        raise RuntimeError("deform_mask has no True entries: no eligible vertices.")
+    if len(eligible_indices) < n_joints:
+        raise RuntimeError(
+            f"Only {len(eligible_indices)} eligible vertices "
+            f"for {n_joints} requested joints. "
+            f"Reduce n_joints or extend the deformation mask."
+        )
+
+    score_norm = np.zeros(n, dtype=np.float64)
+    s_elig = score[eligible_indices]
+    s_min, s_max = s_elig.min(), s_elig.max()
+    score_norm[eligible_indices] = (s_elig - s_min) / (s_max - s_min + 1e-12)
+
+    first = int(eligible_indices[np.argmax(score_norm[eligible_indices])])
+    selected = [first]
+    min_dists = np.linalg.norm(verts - verts[first], axis=1)
+    min_dists[~mask] = 0.0
+
+    for _ in range(n_joints - 1):
+        criterion = min_dists * (1.0 + feature_weight * score_norm)
+        criterion[~mask] = -1.0
+
+        next_v = int(np.argmax(criterion))
+        selected.append(next_v)
+        d = np.linalg.norm(verts - verts[next_v], axis=1)
+        min_dists = np.minimum(min_dists, d)
+        min_dists[~mask] = 0.0
+
+    return selected

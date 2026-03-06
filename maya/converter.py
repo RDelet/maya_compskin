@@ -5,7 +5,7 @@ from typing import List, Any
 
 from ..core import constants, io_utils, math as cp_math
 from ..core.joint_manager import JointManager
-from ..maya import maya_utils
+from ..maya import maya_utils, mesh
 
 from maya import cmds
 from maya.api import OpenMaya as om
@@ -151,7 +151,7 @@ class _SkinConverter(AbstractConverter):
             joints = self._create_joints(num_bones, parent=joint_grp)
 
         skin_obj = maya_utils.create_skin(shape, joints)
-        maya_utils.set_skin_weights(skin_obj, skin_weights)
+        mesh.set_skin_weights(skin_obj, skin_weights)
 
         return skin_obj, joints
 
@@ -195,6 +195,8 @@ class _AnimationConverter(AbstractConverter):
         min_target_count = min(target_count, num_blendshapes)
         joint_count     = len(joints)
 
+        cmds.playbackOptions(minTime=0, maxTime=num_frames, animationStartTime=0, animationEndTime=num_frames)
+
         # J_rest[j] = [[I | p_j], [0,0,0,1]]  — joint j en bind pose world space
         # Utilisé pour composer J_anim = T_j @ J_rest_j
         if joint_manager is not None:
@@ -204,23 +206,16 @@ class _AnimationConverter(AbstractConverter):
         else:
             rest_matrices = None
 
-        cmds.playbackOptions(
-            minTime=0, maxTime=num_frames,
-            animationStartTime=0, animationEndTime=num_frames,
-        )
-        current_time = cmds.currentTime(query=True)
         cmds.refresh(suspend=True)
 
         try:
             anim_data = {jnt: [] for jnt in joints}
             for i in range(num_frames):
-                cmds.currentTime(i)
-
                 pose_weights = np.zeros(num_blendshapes, dtype=np.float32)
                 pose_weights[:min_target_count] = anim_weights[i][:min_target_count]
 
                 # T_j shape : (joint_count, 3, 4)
-                # _generateXforms retourne I à la pose de repos (tous weights=0)
+                # generateXforms retourne I à la pose de repos (tous weights=0)
                 xform = cp_math.generateXforms(pose_weights, shape_xform)
                 pose_matrices = xform.reshape(3, joint_count, 4).transpose(1, 0, 2)
 
@@ -247,19 +242,14 @@ class _AnimationConverter(AbstractConverter):
                         J_anim = T_4x4
 
                     anim_data[jnt].append(J_anim.T.flatten().tolist())
-                    # # Maya attend la matrice en row-major (transposée par rapport à numpy)
-                    # cmds.xform(jnt, matrix=J_anim.T.flatten().tolist(), worldSpace=True)
 
-                # cmds.setKeyframe(joints)
-                # if i == 200:
-                #     break
             for jnt, data in anim_data.items():
+                # continue
                 maya_utils.anim_from_matrice(jnt, data)
 
         except Exception as e:
             constants.logger.error(e)
         finally:
-            cmds.currentTime(current_time)
             cmds.refresh(suspend=False)
 
 

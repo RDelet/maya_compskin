@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import List
 
 import numpy as np
@@ -29,7 +28,10 @@ def assign_shader(mesh: om.MObject, shader_name: str = "initialShadingGroup"):
     shader_fn.addMember(mesh)
 
 
-def get_object(node: str) -> om.MObject:
+def get_object(node: str | om.MDagPath) -> om.MObject:
+    if isinstance(node, om.MDagPath):
+        return node.node()
+
     try:
         __msl.clear()
         __msl.add(node)
@@ -55,7 +57,6 @@ def get_path(node: str | om.MObject) -> om.MObject:
 
 
 def is_valid(handle: om.MObject | om.MDagPath | om.MObjectHandle) -> bool:
-    """!@brief Checks whether the MObject is still valid (i.e. associated to an existing object) or not."""
     if isinstance(handle, om.MDagPath):
         handle = handle.node()
     if isinstance(handle, om.MObject):
@@ -104,23 +105,10 @@ def create_orig(mesh_obj: om.MObject) -> om.MObject:
     return orig_obj
 
 
-def get_mesh_components(mesh_obj: str | om.MObject) -> om.MObject:
-    if isinstance(mesh_obj, str):
+def _build_deformer(mesh_obj: str | om.MObject | om.MDagPath, deformer_type: str, deformer_name: str) -> om.MObject:
+    if not isinstance(mesh_obj, om.MObject):
         mesh_obj = get_object(mesh_obj)
-    if not mesh_obj.hasFn(om.MFn.kMesh):
-        raise TypeError(f"Node {name_of(mesh_obj)} must be a mesh not {mesh_obj.apiTypeStr()}")
 
-    mit_vtx = om.MItMeshVertex(get_path(mesh_obj))
-    single_component = om.MFnSingleIndexedComponent()
-    component = single_component.create(om.MFn.kMeshVertComponent)
-    while not mit_vtx.isDone():
-        single_component.addElement(mit_vtx.index())
-        mit_vtx.next()
-
-    return component
-
-
-def _build_deformer(mesh_obj: om.MObject, deformer_type: str, deformer_name: str) -> om.MObject:
     deformer = cmds.createNode(deformer_type, name=deformer_name)
     mesh_name = name_of(mesh_obj)
     orig_obj = create_orig(mesh_obj)
@@ -133,9 +121,11 @@ def _build_deformer(mesh_obj: om.MObject, deformer_type: str, deformer_name: str
     return get_object(deformer)
 
 
-def create_skin(mesh_obj: om.MObject, influences: list) -> om.MObject:
-    mesh_name = name_of(mesh_obj).split("|")[-1].split(":")[-1]
-    deformer = _build_deformer(mesh_obj, "skinCluster", f"SKIN_{mesh_name}")
+def create_skin(mesh: str | om.MObject | om.MDagPath, influences: list) -> om.MObject:
+    if not isinstance(mesh, str):
+        mesh = name_of(mesh)
+    mesh_short = mesh.split("|")[-1].split(":")[-1]
+    deformer = _build_deformer(mesh, "skinCluster", f"SKIN_{mesh_short}")
     deformer_name = name_of(deformer)
     
     for i, influence in enumerate(influences):
@@ -151,21 +141,6 @@ def create_blendshapes(mesh_obj: om.MObject) -> om.MObject:
     mesh_name = name_of(mesh_obj).split("|")[-1].split(":")[-1]
 
     return _build_deformer(mesh_obj, "blendShape", f"BS_{mesh_name}")
-
-
-def set_skin_weights(skin_obj: om.MObject, weights: np.array, normalize: bool = True):
-    skin_name = name_of(skin_obj)
-    skin_fn = oma.MFnSkinCluster(skin_obj)
-    output_shapes = skin_fn.getOutputGeometry()
-    if len(output_shapes) == 0:
-        raise RuntimeError(f"No output geometry found on {skin_name} !")
-    mesh_obj = output_shapes[0]
-    mesh_path = get_path(mesh_obj)
-    component = get_mesh_components(mesh_obj)
-    influences_ids = om.MIntArray(list(range(weights.shape[1])))
-    weights = om.MDoubleArray(weights.flatten())    
-    
-    return skin_fn.setWeights(mesh_path, component, influences_ids, weights, normalize, returnOldWeights=True)
 
 
 def set_blendshape_targets(shape: om.MObject, deltas: np.array) -> om.MObject:
@@ -200,19 +175,6 @@ def set_blendshape_targets(shape: om.MObject, deltas: np.array) -> om.MObject:
     return bs_obj
 
 
-def srt_from_matrix(matrix: list | tuple | om.MMatrix) -> List[List[float], List[float], List[float]]:
-    if not isinstance(matrix, om.MMatrix):
-        matrix = om.MMatrix(matrix)
-    
-    transformation = om.MTransformationMatrix(matrix)
-    
-    scale = transformation.scale(om.MSpace.kWorld)
-    rotate = [math.degrees(x) for x in transformation.rotation()]
-    translate = transformation.translation(om.MSpace.kWorld)
-
-    return scale, rotate, translate
-
-
 def current_time(current) -> int:
     return cmds.currentTime(current)
 
@@ -239,10 +201,23 @@ def create_animation(node: str | om.MObject, attr: str, keys: List[float]) -> om
     curve_fn = oma.MFnAnimCurve()
     curve_obj = curve_fn.create(plug)
     k_linear = curve_fn.kTangentLinear
-    times = [start_frame + i for i in range(len(keys))]
+    times = [om.MTime(start_frame + i, om.MTime.uiUnit()) for i in range(len(keys))]
     curve_fn.addKeysWithTangents(times, keys, tangentInType=k_linear, tangentOutType=k_linear)
 
     return curve_obj
+
+
+def srt_from_matrix(matrix: list | tuple | om.MMatrix) -> List[List[float], List[float], List[float]]:
+    if not isinstance(matrix, om.MMatrix):
+        matrix = om.MMatrix(matrix)
+    
+    transformation = om.MTransformationMatrix(matrix)
+    
+    scale = transformation.scale(om.MSpace.kWorld)
+    rotate = transformation.rotation(asQuaternion=False)
+    translate = transformation.translation(om.MSpace.kWorld)
+
+    return scale, rotate, translate
 
 
 def anim_from_matrice(node: str | om.MObect, anim_matrices: List[om.MMatrix]) -> List[om.MObject]:
