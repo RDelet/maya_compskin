@@ -1,90 +1,47 @@
 from __future__ import annotations
+
+from abc import ABC, abstractmethod
 import numpy as np
 from pathlib import Path
-from typing import List, Any
-
-from ..core import constants, io_utils, math as cp_math
-from ..core.joint_manager import JointManager
-from ..maya import maya_utils, mesh
+from typing import List
 
 from maya import cmds
 from maya.api import OpenMaya as om
 
-
-class AbstractConverter:
-
-    def __init__(self, npz_path: str | Path | None = None):
-        self.path = None
-        self._data = None
-        self._is_initialized = False
-
-        if npz_path:
-            if isinstance(npz_path, str):
-                npz_path = Path(npz_path)
-            if not npz_path.suffix.endswith("npz"):
-                raise RuntimeError(f"Invalid file extension: {npz_path.suffix} !")
-            if npz_path.is_dir():
-                raise RuntimeError("Path must be a file path not a directory !")
-            if not npz_path.exists():
-                raise RuntimeError(f"file not found at: {npz_path}")
-            
-            self.path = npz_path
-            self._data = io_utils.read_npz(npz_path)
-            self._is_initialized = True
-    
-    def __getitem__(self, key: str) -> Any:
-        return self.get(key)
-    
-    @property
-    def is_initialized(self) -> bool:
-        return self._is_initialized
-
-    @property
-    def data(self) -> dict:
-        if not self._is_initialized:
-            raise RuntimeError("No data initialized !")
-        return self._data
-
-    @classmethod
-    def from_converter(cls, other: AbstractConverter) -> AbstractConverter:
-        if not isinstance(other, AbstractConverter):
-            raise TypeError("Value must be an AbstractConverter !")
-        if not other.is_initialized:
-            raise RuntimeError("No data initialized on source converter !")
-
-        new_cls = cls()
-        new_cls.path = other.path
-        new_cls._data = other.data
-        new_cls._is_initialized = True
-
-        return new_cls
-
-    def get(self, key: str) -> Any:
-        if not self._is_initialized:
-            raise RuntimeError("No data initialized !")
-
-        if key not in self._data:
-            raise RuntimeError(f"Key {key} does not exist in {self.path}")
-
-        return self._data[key]
-        
-    def convert(self, *args, **kwargs):
-        if not self._is_initialized:
-            raise RuntimeError("No data initialized !")
+from ..core import constants, math as cp_math
+from ..core.joint_manager import JointManager
+from ..core.data import NpzData
+from ..maya import maya_utils, mesh
 
 
-class Converter(AbstractConverter):
+class Converter:
 
     def __init__(self, npz_path: str | Path):
-        super().__init__(npz_path)
+        self._data = NpzData(npz_path)
+        self.json = _JsonConverter(self._data)
+        self.mesh = _MeshConverter(self._data)
+        self.skin = _SkinConverter(self._data)
+        self.anim = _AnimationConverter(self._data)
+    
+    @property
+    def data(self) -> NpzData:
+        return self._data
 
-        self.json = _JsonConverter.from_converter(self)
-        self.mesh = _MeshConverter.from_converter(self)
-        self.skin = _SkinConverter.from_converter(self)
-        self.anim = _AnimationConverter.from_converter(self)
+
+class NpzConverter(ABC):
+
+    def __init__(self, data: NpzData):
+        self._data = data
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(path: {self._data.path})"
+    
+    @abstractmethod
+    def convert(self):
+        pass
 
 
-class _JsonConverter(AbstractConverter):
+class _JsonConverter(NpzConverter):
 
     def _get_output_path(self, npz_path: str | Path, extension: str) -> Path:
         if isinstance(npz_path, str):
@@ -92,22 +49,20 @@ class _JsonConverter(AbstractConverter):
         return npz_path.with_suffix(extension)
 
     def convert(self):
-        super().convert()
         data = {}
         for key in self._data.keys():
-            array = self.get(key)
+            array = self._data[key]
             data[key] = array.item() if array.dtype == 'O'else array.tolist()
 
         maya_utils.dump_json(data, self._get_output_path(self.path, '.json'))
 
 
-class _MeshConverter(AbstractConverter):
+class _MeshConverter(NpzConverter):
 
     def convert(self, with_blendshapes: bool = False) -> om.MObject:
-        super().convert()
-        mesh_name = self.path.stem
-        rest_points = om.MPointArray(self.get('rest_verts'))
-        rest_faces = self.get('rest_faces')
+        mesh_name = self._data.path.stem
+        rest_points = om.MPointArray(self._data.get('rest_verts'))
+        rest_faces = self._data.get('rest_faces')
         poly_count = om.MIntArray([len(f) for f in rest_faces])
         poly_connect = om.MIntArray(rest_faces.ravel())
         u_values = []
@@ -123,24 +78,22 @@ class _MeshConverter(AbstractConverter):
         mdg_mod.doIt()
         
         if with_blendshapes:
-            deltas = self.get('deltas')
+            deltas = self._data.get('deltas')
             if deltas.shape[0] > 0:
                 maya_utils.set_blendshape_targets(mesh_obj, deltas)
     
         return mesh_obj
 
 
-class _SkinConverter(AbstractConverter):
-
-    """TODO: Refacto ! """
+class _SkinConverter(NpzConverter):
 
     def convert(self, shape: str | om.MObject, joint_manager: JointManager | None = None) -> tuple:
-        super().convert()
-        skin_weights = self.get("weights")
+        skin_weights = self._data.get("weights")
         num_bones = skin_weights.shape[1]
 
+        # TODO: use data in input file
+        # joint_position = self._data.get("jointPositions")
         joint_grp = cmds.createNode("transform", name="JOINTS_GRP")
-
         if joint_manager is not None:
             joints = self._create_joints_at_positions(
                 joint_manager.positions,
@@ -183,26 +136,24 @@ class _SkinConverter(AbstractConverter):
         return joints
 
 
-class _AnimationConverter(AbstractConverter):
+class _AnimationConverter(NpzConverter):
 
-    def convert(self, joints: list[str], shape_xform: np.ndarray, joint_manager=None):
-        super().convert()
-
-        anim_weights    = self.get("weights")
-        num_frames      = anim_weights.shape[0]
-        target_count    = anim_weights.shape[1]
+    def convert(self, joints: List[str], shape_xform: np.ndarray):
+        anim_weights = self._data.get("weights")
+        num_frames = anim_weights.shape[0]
+        target_count = anim_weights.shape[1]
         num_blendshapes = shape_xform.shape[0] // 3
         min_target_count = min(target_count, num_blendshapes)
-        joint_count     = len(joints)
+        joint_count = len(joints)
 
         cmds.playbackOptions(minTime=0, maxTime=num_frames, animationStartTime=0, animationEndTime=num_frames)
 
         # J_rest[j] = [[I | p_j], [0,0,0,1]]  — joint j en bind pose world space
         # Utilisé pour composer J_anim = T_j @ J_rest_j
-        if joint_manager is not None:
-            positions    = joint_manager.positions               # (P, 3) world space
+        if "jointPositions" in self._data:
+            joint_positions = self._data.get("jointPositions")
             rest_matrices = np.tile(np.eye(4), (joint_count, 1, 1))
-            rest_matrices[:, :3, 3] = positions                 # translation en colonne
+            rest_matrices[:, :3, 3] = joint_positions
         else:
             rest_matrices = None
 
@@ -237,7 +188,8 @@ class _AnimationConverter(AbstractConverter):
                         #   = [[I+R_j, t_j]] @ v
                         #   = v + R_j@v + t_j
                         #   = v + T_j @ (v - p_j)  ✓  (régime linéaire R_j petit)
-                        J_anim = T_4x4 @ rest_matrices[j]
+                        # J_anim = T_4x4 @ rest_matrices[j]
+                        J_anim = rest_matrices[j] @ T_4x4
                     else:
                         J_anim = T_4x4
 
@@ -254,16 +206,11 @@ class _AnimationConverter(AbstractConverter):
 
 
 """
-import imp
-
 from maya import cmds
 
 from maya_compskin.core import io_utils
-from maya_compskin.maya import converter
+from maya_compskin.maya.converter import Converter
 from maya_compskin.core.joint_manager import JointManager
-
-imp.reload(converter)
-imp.reload(io_utils)
 
 cmds.file(new=True, force=True)
 
@@ -272,11 +219,11 @@ aura_out = io_utils.get_output_from_name("aura")
 test_anim = io_utils.get_input_from_name("test_anim")
 joint_manager = JointManager(aura_in.parent / "Aura_JointPosition.json")
 
-converter_in = converter.Converter(aura_in)
-converter_out = converter.Converter(aura_out)
-converter_anim = converter.Converter(test_anim)
+converter_in = Converter(aura_in)
+converter_out = Converter(aura_out)
+converter_anim = Converter(test_anim)
 
 mesh_obj = converter_in.mesh.convert()
 skin_obj, joints = converter_out.skin.convert(mesh_obj, joint_manager)
-converter_anim.anim.convert(joints, converter_out["shapeXform"])
+converter_anim.anim.convert(joints, converter_out.data["shapeXform"])
 """

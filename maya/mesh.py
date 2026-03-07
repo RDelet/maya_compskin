@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
-from typing import List, Optional
+from typing import List
 
 from maya import cmds
 from maya.api import OpenMaya as om, OpenMayaAnim as oma
@@ -76,13 +76,17 @@ def get_components(mesh_obj: str | om.MObject) -> om.MObject:
 
 def auto_place_joints(mesh: str | om.MObject | om.MDagPath, joint_count: int,
                       feature_weight: float = 2.0,
-                deform_mask: Optional[np.ndarray] = None):
-    mesh   = extract_data(mesh)
-    result = place_joints_on_mesh(mesh, joint_count,
+                      deform_mask: np.ndarray | None = None):
+    mesh_data = extract_data(mesh)
+    result = place_joints_on_mesh(mesh_data, joint_count,
                                   feature_weight=feature_weight,
                                   deform_mask=deform_mask)
+    
+    if deform_mask is not None:
+        root_position = mesh_data.verts[~deform_mask].mean(axis=0).tolist()
+        np.insert(result.joint_positions, 0, root_position)
 
-    return create_joints(result, mesh_name=mesh.name)
+    return create_joints(result, mesh_name=mesh_data.name)
 
 
 def auto_skin(path: str | om.MObject | om.MDagPath, joints: List[str]):

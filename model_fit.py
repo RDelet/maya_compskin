@@ -16,10 +16,11 @@ from maya_compskin.core.trainer import Trainer
 
 def main():
 
-    faces = [# "bowen",
-             # "jupiter",
-             # "proteus",
-             "aura"]
+    faces = ["bowen",
+             "jupiter",
+             "proteus",
+             # "aura"
+             ]
     for face in faces:
         try:
             npz_path = io_utils.get_input_from_name(face)
